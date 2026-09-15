@@ -136,10 +136,46 @@ supports_websockets = false           # 必须关闭，否则 WS 握手会被拒
 | `RETRY_BACKOFF` | `--retry-backoff` | `500ms` | 指数退避起始值 |
 | `MAX_RETRY_AFTER` | `--max-retry-after` | `1m` | 单次退避上限 |
 
-### 常驻运行（可选）
+### 后台常驻运行（Linux · systemd）
 
-Linux 推荐 systemd 用户服务（`Restart=always` + `loginctl enable-linger` 开机自启），
-配置经 `EnvironmentFile` 注入；macOS 可加入登录项或用 launchd。
+程序跑在自己的终端窗口里难免误关，推荐交给 systemd 管理（崩溃自动拉起、开机自启）。
+仓库提供现成模板（[deploy/](deploy/)）：
+
+```bash
+# 1. 放置程序与配置（示例目录 ~/steady-relay/，按实际解压位置调整）
+cp deploy/relay.env          ~/steady-relay/
+cp deploy/steady-relay.service ~/.config/systemd/user/
+#    编辑 service 文件：把 YOU 替换成你的用户名、核对两处路径
+
+# 2. 启用 + 开机自启
+systemctl --user daemon-reload
+systemctl --user enable --now steady-relay
+loginctl enable-linger $USER    # 可选：未登录也常驻
+
+# 3. 日常管理
+systemctl --user status steady-relay     # 看状态
+systemctl --user restart steady-relay    # 改完 relay.env 后重启生效
+```
+
+macOS 可将启动命令加入"登录项"或使用 launchd；Windows 可用任务计划程序或 NSSM。
+
+### 日志查看
+
+systemd 模式下所有输出写入程序目录的 `relay.log`（内容与前台运行完全一致）：
+
+```bash
+tail -f relay.log                                        # 全部：请求 + 重试 + 报表
+tail -f relay.log | grep --line-buffered '\[stats\]'     # 只看每 3 分钟的指标报表
+tail -f relay.log | grep --line-buffered -v '\[stats\]'  # 只看流量明细（不要报表）
+grep '\[stats\]' relay.log | tail -5                     # 随时看最新一份报表
+```
+
+建议加两个别名到 `~/.bashrc`，以后敲 `relay` 看报表、`relaylog` 看流量：
+
+```bash
+echo "alias relay='tail -f ~/steady-relay/relay.log | grep --line-buffered stats'" >> ~/.bashrc
+echo "alias relaylog='tail -f ~/steady-relay/relay.log | grep --line-buffered -v stats'" >> ~/.bashrc
+```
 
 ### 日志与观测
 

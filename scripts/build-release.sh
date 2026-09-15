@@ -50,6 +50,9 @@ build_target() {
   cp "$PROJECT_ROOT/packaging/README.txt" "$package_dir/README.txt"
   cp "$PROJECT_ROOT/README.md" "$package_dir/README.md"
   cp "$PROJECT_ROOT/README.zh-CN.md" "$package_dir/README.zh-CN.md" 2>/dev/null || true
+  mkdir -p "$package_dir/deploy"
+  cp "$PROJECT_ROOT/deploy/relay.env" "$package_dir/deploy/relay.env" 2>/dev/null || true
+  cp "$PROJECT_ROOT/deploy/steady-relay.service" "$package_dir/deploy/steady-relay.service" 2>/dev/null || true
   cp "$PROJECT_ROOT/LICENSE" "$package_dir/LICENSE"
   if [ "$target_os" = windows ]; then
     cp "$PROJECT_ROOT/packaging/start.bat" "$package_dir/start.bat"

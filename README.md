@@ -110,6 +110,43 @@ supports_websockets = false
 | `RETRY_BACKOFF` | `--retry-backoff` | `500ms` | Initial backoff |
 | `MAX_RETRY_AFTER` | `--max-retry-after` | `1m` | Backoff ceiling |
 
+### Run as a Background Service (Linux · systemd)
+
+Running in a terminal window is easy to close by accident. The recommended setup is a
+systemd user service (auto-restart, starts at boot). Ready-made templates are in
+[deploy/](deploy/):
+
+```bash
+# 1. Place the binary and config (example dir ~/steady-relay/, adjust to yours)
+cp deploy/relay.env              ~/steady-relay/
+cp deploy/steady-relay.service   ~/.config/systemd/user/
+#    Edit the service file: replace YOU with your username, check both paths
+
+# 2. Enable + start at login
+systemctl --user daemon-reload
+systemctl --user enable --now steady-relay
+loginctl enable-linger $USER     # optional: keep running when logged out
+
+# 3. Day-to-day
+systemctl --user status steady-relay    # status
+systemctl --user restart steady-relay   # restart after editing relay.env
+```
+
+On macOS add the start command to Login Items or use launchd; on Windows use Task
+Scheduler or NSSM.
+
+### Viewing Logs
+
+Under systemd all output is appended to `relay.log` in the program directory
+(identical to what you would see in a foreground terminal):
+
+```bash
+tail -f relay.log                                        # everything: requests + retries + reports
+tail -f relay.log | grep --line-buffered '\[stats\]'     # metrics reports only (every 3 min)
+tail -f relay.log | grep --line-buffered -v '\[stats\]'  # traffic only, no reports
+grep '\[stats\]' relay.log | tail -5                     # latest report on demand
+```
+
 ## Building from Source
 
 ```bash

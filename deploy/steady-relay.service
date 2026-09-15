@@ -1,0 +1,25 @@
+# steady-relay systemd 用户服务模板
+# 用法：把 YOU 替换成你的用户名，路径按实际解压位置调整后：
+#   mkdir -p ~/.config/systemd/user
+#   cp steady-relay.service ~/.config/systemd/user/
+#   systemctl --user daemon-reload
+#   systemctl --user enable --now steady-relay
+#   loginctl enable-linger $USER   # 开机自启（未登录也运行）
+
+[Unit]
+Description=steady-relay - auto-retry proxy for Codex
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/home/YOU/steady-relay
+EnvironmentFile=/home/YOU/steady-relay/relay.env
+ExecStart=/home/YOU/steady-relay/steady-relay --listen 127.0.0.1:8080 --passthrough
+Restart=always
+RestartSec=2
+StandardOutput=append:/home/YOU/steady-relay/relay.log
+StandardError=append:/home/YOU/steady-relay/relay.log
+
+[Install]
+WantedBy=default.target
