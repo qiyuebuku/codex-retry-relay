@@ -4,6 +4,11 @@
 自动拦截容量错误（429 / "Selected model is at capacity"）并指数退避重试，
 让你的任务永远不因瞬时错误而中断。
 
+> **⚠️ 先把话说清楚：本工具不解决 429 的根本问题。**
+> 如果你的 Codex 账号被服务端标记为低权重/限流，429 本身会持续存在——任何代理都无法改变
+> 服务端对你账号的配额判定。steady-relay 能做的是**尽可能降低 429 带来的影响**：
+> 自动重试、不打断进行中的任务、免手动点击重试，**让你少受点罪**。
+
 [English](#english)
 
 ---
@@ -155,6 +160,12 @@ go test ./...                                  # 运行测试
 the Codex client and its backend that intercepts capacity errors
 (429 / "Selected model is at capacity") and retries with exponential backoff,
 so your work is never interrupted by transient failures.
+
+> **⚠️ To be clear up front: this tool does NOT fix the root cause of 429s.**
+> If your Codex account is deprioritized or rate-limited server-side, the 429s themselves
+> will keep happening — no proxy can change how the backend meters your account.
+> What steady-relay does is **minimize the impact**: automatic retries, no interrupted
+> tasks, no manual retry clicking. **It makes 429s far less painful — nothing more.**
 
 ## The Problem It Solves
 
