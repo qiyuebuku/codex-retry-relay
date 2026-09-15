@@ -62,7 +62,7 @@ type config struct {
 type statsState struct {
 	mu       sync.Mutex
 	day      string
-	inflight map[string]time.Time
+	inflight map[string]*inflightReq
 
 	dStart, dOK, dFail, dRescue int // today
 	tStart, tOK, tFail, tRescue int // process lifetime
@@ -71,7 +71,14 @@ type statsState struct {
 	ptStart, ptOK, ptFail, ptRescue int // previous snapshot (total deltas)
 }
 
-var relayStats = &statsState{inflight: make(map[string]time.Time)}
+// inflightReq tracks liveness of a proxied request; retrying marks that at
+// least one attempt has already failed and the request is being retried.
+type inflightReq struct {
+	last     time.Time
+	retrying bool
+}
+
+var relayStats = &statsState{inflight: make(map[string]*inflightReq)}
 
 // statsStateFile persists counters across restarts so that "today" and
 // "lifetime" totals survive a process restart. It is rewritten atomically on
@@ -157,14 +164,21 @@ func (s *statsState) begin(id string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.rollDay()
-	s.inflight[id] = time.Now()
+	s.inflight[id] = &inflightReq{last: time.Now()}
 	s.dStart++
 	s.tStart++
 }
 
-func (s *statsState) touch(id string) {
+// touch refreshes liveness for an attempt; attempt > 0 means this is a retry
+// and marks the request as currently retrying.
+func (s *statsState) touch(id string, attempt int) {
 	s.mu.Lock()
-	s.inflight[id] = time.Now()
+	if req := s.inflight[id]; req != nil {
+		req.last = time.Now()
+		if attempt > 0 {
+			req.retrying = true
+		}
+	}
 	s.mu.Unlock()
 }
 
@@ -217,14 +231,18 @@ func (s *statsState) report(window time.Duration) {
 	s.rollDay()
 	now := time.Now()
 	stuck := 0
-	for _, t := range s.inflight {
-		if now.Sub(t) > 10*time.Minute {
+	retrying := 0
+	for _, req := range s.inflight {
+		if now.Sub(req.last) > 10*time.Minute {
 			stuck++
+		}
+		if req.retrying {
+			retrying++
 		}
 	}
 	log.Printf("[stats] 📊 %s", now.Format("2006/01/02 15:04:05"))
-	log.Printf("[stats] [增量 %s] 调用 +%d | 成功 +%d | 在途 %d | 救回 +%d | 成功率 %s",
-		window.Round(time.Second), maxInt(s.dStart-s.pdStart, 0), maxInt(s.dOK-s.pdOK, 0), len(s.inflight), maxInt(s.dRescue-s.pdRescue, 0),
+	log.Printf("[stats] [增量 %s] 调用 +%d | 成功 +%d | 在途 %d（重试中 %d）| 救回 +%d | 成功率 %s",
+		window.Round(time.Second), maxInt(s.dStart-s.pdStart, 0), maxInt(s.dOK-s.pdOK, 0), len(s.inflight), retrying, maxInt(s.dRescue-s.pdRescue, 0),
 		statsPct(maxInt(s.dOK-s.pdOK, 0), maxInt(s.dOK-s.pdOK, 0)+maxInt(s.dFail-s.pdFail, 0)))
 	log.Printf("[stats] [今日] 调用 %d | 成功 %d | 失败(未救回) %d | 救回 %d | 成功率 %s（若无重试保护 %s）",
 		s.dStart, s.dOK, s.dFail, s.dRescue, statsPct(s.dOK, s.dStart), statsPct(s.dOK-s.dRescue, s.dStart))
@@ -536,7 +554,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var lastErr error
 	for attempt := 0; attempt <= p.cfg.maxRetries; attempt++ {
 		attemptStarted := time.Now()
-		relayStats.touch(requestID)
+		relayStats.touch(requestID, attempt)
 		resp, err := p.attempt(r.Context(), r, target, body, requestHadBody)
 		if err != nil {
 			lastErr = err
