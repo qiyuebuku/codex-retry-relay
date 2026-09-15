@@ -65,9 +65,11 @@ intercept 100% of retryable scenarios.
 [stats] 卡死: 0
 ```
 
-(Delta since the previous report / today / since process start. `若无重试保护` =
+(Delta since the previous report / today / since first run. `若无重试保护` =
 the success rate the same traffic would have had without retries — the gap is what
-the proxy bought you. Stuck = requests with no progress for over 10 minutes.)
+the proxy bought you. Stuck = requests with no progress for over 10 minutes.
+Counters are persisted to `steady-relay.stats.json` on every report, so they
+**survive restarts**; "today" resets on a new day while "lifetime" keeps accumulating.)
 
 ## Quick Start
 

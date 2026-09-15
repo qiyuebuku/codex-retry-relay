@@ -73,6 +73,76 @@ type statsState struct {
 
 var relayStats = &statsState{inflight: make(map[string]time.Time)}
 
+// statsStateFile persists counters across restarts so that "today" and
+// "lifetime" totals survive a process restart. It is rewritten atomically on
+// every report tick; at most one report interval of counts is lost on a crash.
+const statsStateFile = "steady-relay.stats.json"
+
+type statsSnapshot struct {
+	Day      string `json:"day"`
+	DStart   int    `json:"daily_start"`
+	DOK      int    `json:"daily_ok"`
+	DFail    int    `json:"daily_fail"`
+	DRescue  int    `json:"daily_rescue"`
+	TStart   int    `json:"total_start"`
+	TOK      int    `json:"total_ok"`
+	TFail    int    `json:"total_fail"`
+	TRescue  int    `json:"total_rescue"`
+	PdStart  int    `json:"prev_daily_start"`
+	PdOK     int    `json:"prev_daily_ok"`
+	PdFail   int    `json:"prev_daily_fail"`
+	PdRescue int    `json:"prev_daily_rescue"`
+	PtStart  int    `json:"prev_total_start"`
+	PtOK     int    `json:"prev_total_ok"`
+	PtFail   int    `json:"prev_total_fail"`
+	PtRescue int    `json:"prev_total_rescue"`
+}
+
+func (s *statsState) snapshotLocked() statsSnapshot {
+	return statsSnapshot{
+		Day: s.day, DStart: s.dStart, DOK: s.dOK, DFail: s.dFail, DRescue: s.dRescue,
+		TStart: s.tStart, TOK: s.tOK, TFail: s.tFail, TRescue: s.tRescue,
+		PdStart: s.pdStart, PdOK: s.pdOK, PdFail: s.pdFail, PdRescue: s.pdRescue,
+		PtStart: s.ptStart, PtOK: s.ptOK, PtFail: s.ptFail, PtRescue: s.ptRescue,
+	}
+}
+
+func (s *statsState) saveLocked() {
+	data, err := json.Marshal(s.snapshotLocked())
+	if err != nil {
+		return
+	}
+	tmp := statsStateFile + ".tmp"
+	if os.WriteFile(tmp, data, 0o600) == nil {
+		_ = os.Rename(tmp, statsStateFile)
+	}
+}
+
+// restore loads previously persisted counters; totals carry over, daily
+// counters reset when the stored day is not today.
+func (s *statsState) restore() {
+	data, err := os.ReadFile(statsStateFile)
+	if err != nil {
+		return
+	}
+	var snap statsSnapshot
+	if json.Unmarshal(data, &snap) != nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.tStart, s.tOK, s.tFail, s.tRescue = snap.TStart, snap.TOK, snap.TFail, snap.TRescue
+	s.ptStart, s.ptOK, s.ptFail, s.ptRescue = snap.PtStart, snap.PtOK, snap.PtFail, snap.PtRescue
+	s.day = time.Now().Format("2006/01/02")
+	if snap.Day == s.day {
+		s.dStart, s.dOK, s.dFail, s.dRescue = snap.DStart, snap.DOK, snap.DFail, snap.DRescue
+		s.pdStart, s.pdOK, s.pdFail, s.pdRescue = snap.PdStart, snap.PdOK, snap.PdFail, snap.PdRescue
+		log.Printf("[startup] stats_restored day=%s today_calls=%d total_calls=%d", snap.Day, snap.DStart, snap.TStart)
+	} else {
+		log.Printf("[startup] stats_restored new_day previous_day=%s total_calls=%d", snap.Day, snap.TStart)
+	}
+}
+
 func (s *statsState) today() string { return time.Now().Format("2006/01/02") }
 
 func (s *statsState) rollDay() {
@@ -167,9 +237,13 @@ func (s *statsState) report(window time.Duration) {
 	}
 	s.pdStart, s.pdOK, s.pdFail, s.pdRescue = s.dStart, s.dOK, s.dFail, s.dRescue
 	s.ptStart, s.ptOK, s.ptFail, s.ptRescue = s.tStart, s.tOK, s.tFail, s.tRescue
+	s.saveLocked()
 }
 
 func statsLoop(interval time.Duration) {
+	// Restore persisted counters (same day keeps daily totals; totals always
+	// carry over) before emitting the immediate first report.
+	relayStats.restore()
 	// Emit one report immediately so that anyone tail-ing the log sees
 	// output right away instead of waiting a full interval after startup.
 	relayStats.report(interval)
