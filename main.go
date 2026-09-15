@@ -16,6 +16,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"time"
@@ -49,6 +50,131 @@ type config struct {
 	// upstreams that do not serve the OpenAI-compatible API under a /v1
 	// prefix (for example the ChatGPT subscription codex backend).
 	passthrough bool
+	// statsInterval controls the periodic metrics report; 0 disables it.
+	statsInterval time.Duration
+}
+
+// ---------- periodic metrics report ----------
+
+// statsState tracks request outcomes and prints a compact report every
+// statsInterval: increments since the previous report, today's totals, and
+// process-lifetime totals, plus in-flight/stuck detection.
+type statsState struct {
+	mu       sync.Mutex
+	day      string
+	inflight map[string]time.Time
+
+	dStart, dOK, dFail, dRescue int // today
+	tStart, tOK, tFail, tRescue int // process lifetime
+
+	pdStart, pdOK, pdFail, pdRescue int // previous snapshot (daily deltas)
+	ptStart, ptOK, ptFail, ptRescue int // previous snapshot (total deltas)
+}
+
+var relayStats = &statsState{inflight: make(map[string]time.Time)}
+
+func (s *statsState) today() string { return time.Now().Format("2006/01/02") }
+
+func (s *statsState) rollDay() {
+	if s.day != s.today() {
+		s.day = s.today()
+		s.dStart, s.dOK, s.dFail, s.dRescue = 0, 0, 0, 0
+		s.pdStart, s.pdOK, s.pdFail, s.pdRescue = 0, 0, 0, 0
+	}
+}
+
+func (s *statsState) begin(id string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rollDay()
+	s.inflight[id] = time.Now()
+	s.dStart++
+	s.tStart++
+}
+
+func (s *statsState) touch(id string) {
+	s.mu.Lock()
+	s.inflight[id] = time.Now()
+	s.mu.Unlock()
+}
+
+// finish records the outcome of a proxied request: ok counts real successes
+// (a delivered failure event such as response.failed counts as a failure via
+// leak), rescued marks successes that needed more than one attempt.
+func (s *statsState) finish(id string, ok, leak, rescued bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rollDay()
+	delete(s.inflight, id)
+	if ok && !leak {
+		if rescued {
+			s.dRescue++
+			s.tRescue++
+		}
+		s.dOK++
+		s.tOK++
+		return
+	}
+	s.dFail++
+	s.tFail++
+}
+
+// drop removes an abandoned request (client canceled) from in-flight
+// tracking without counting it as success or failure.
+func (s *statsState) drop(id string) {
+	s.mu.Lock()
+	delete(s.inflight, id)
+	s.mu.Unlock()
+}
+
+func statsPct(part, whole int) string {
+	if whole <= 0 {
+		return "n/a"
+	}
+	return strconv.FormatFloat(float64(part)*100/float64(whole), 'f', 1, 64) + "%"
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
+func (s *statsState) report(window time.Duration) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.rollDay()
+	now := time.Now()
+	stuck := 0
+	for _, t := range s.inflight {
+		if now.Sub(t) > 10*time.Minute {
+			stuck++
+		}
+	}
+	log.Printf("[stats] 📊 %s", now.Format("2006/01/02 15:04:05"))
+	log.Printf("[stats] [增量 %s] 调用 +%d | 成功 +%d | 在途 %d | 救回 +%d | 成功率 %s",
+		window.Round(time.Second), maxInt(s.dStart-s.pdStart, 0), maxInt(s.dOK-s.pdOK, 0), len(s.inflight), maxInt(s.dRescue-s.pdRescue, 0),
+		statsPct(maxInt(s.dOK-s.pdOK, 0), maxInt(s.dOK-s.pdOK, 0)+maxInt(s.dFail-s.pdFail, 0)))
+	log.Printf("[stats] [今日] 调用 %d | 成功 %d | 失败(未救回) %d | 救回 %d | 成功率 %s（若无重试保护 %s）",
+		s.dStart, s.dOK, s.dFail, s.dRescue, statsPct(s.dOK, s.dStart), statsPct(s.dOK-s.dRescue, s.dStart))
+	log.Printf("[stats] [累计] 调用 %d | 成功 %d | 失败(未救回) %d | 救回 %d | 成功率 %s（若无重试保护 %s）",
+		s.tStart, s.tOK, s.tFail, s.tRescue, statsPct(s.tOK, s.tStart), statsPct(s.tOK-s.tRescue, s.tStart))
+	if stuck > 0 {
+		log.Printf("[stats] ⚠️ 疑似卡死(>10min无进展) %d 个", stuck)
+	} else {
+		log.Printf("[stats] 卡死: 0")
+	}
+	s.pdStart, s.pdOK, s.pdFail, s.pdRescue = s.dStart, s.dOK, s.dFail, s.dRescue
+	s.ptStart, s.ptOK, s.ptFail, s.ptRescue = s.tStart, s.tOK, s.tFail, s.tRescue
+}
+
+func statsLoop(interval time.Duration) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for range ticker.C {
+		relayStats.report(interval)
+	}
 }
 
 type proxy struct {
@@ -117,6 +243,10 @@ func main() {
 		log.Printf("[startup] upstream_host=%s pinned_ip=none dns_bypass=disabled", cfg.upstream.Hostname())
 	}
 	log.Printf("[startup] buffer_until_success=%t max_buffer=%dMiB", cfg.bufferUntilSuccess, maxBufferedStreamBytes/(1024*1024))
+	if cfg.statsInterval > 0 {
+		log.Printf("[startup] stats_interval=%s", cfg.statsInterval)
+		go statsLoop(cfg.statsInterval)
+	}
 	if err := server.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
@@ -234,6 +364,10 @@ func loadConfig() (config, error) {
 	if err != nil {
 		return config{}, err
 	}
+	statsIntervalDefault, err := envDuration("STATS_INTERVAL", 3*time.Minute)
+	if err != nil {
+		return config{}, err
+	}
 
 	upstreamValue := flag.String("upstream", upstreamDefault, "required upstream OpenAI-compatible base URL")
 	upstreamIPValue := flag.String("upstream-ip", os.Getenv("UPSTREAM_IP"), "optional fixed IP for the upstream host; omit to use system DNS")
@@ -244,9 +378,10 @@ func loadConfig() (config, error) {
 	maxRetryWait := flag.Duration("max-retry-after", maxRetryDefault, "maximum Retry-After/backoff delay")
 	bufferMode := flag.Bool("buffer-until-success", bufferUntilSuccess, "buffer SSE responses until response.completed before sending them to the client")
 	passthroughMode := flag.Bool("passthrough", passthroughDefault, "forward any request path unchanged; use for upstreams without a /v1 prefix such as the ChatGPT subscription codex backend")
+	statsInterval := flag.Duration("stats-interval", statsIntervalDefault, "periodically log a metrics report (delta/today/total); 0 disables")
 	flag.Parse()
 
-	if *maxRetries < 0 || *backoff < 0 || *timeout <= 0 || *maxRetryWait < 0 {
+	if *maxRetries < 0 || *backoff < 0 || *timeout <= 0 || *maxRetryWait < 0 || *statsInterval < 0 {
 		return config{}, errors.New("max-retries and durations must be non-negative; request-timeout must be positive")
 	}
 	if strings.TrimSpace(*upstreamValue) == "" {
@@ -280,6 +415,7 @@ func loadConfig() (config, error) {
 		maxRetryWait:       *maxRetryWait,
 		bufferUntilSuccess: *bufferMode,
 		passthrough:        *passthroughMode,
+		statsInterval:      *statsInterval,
 	}, nil
 }
 
@@ -303,6 +439,9 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	relayStats.begin(requestID)
+	defer relayStats.drop(requestID) // safety net for silent returns (client cancels)
+
 	requestHadBody := r.Body != nil && r.Body != http.NoBody
 	var body []byte
 	if requestHadBody {
@@ -320,6 +459,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var lastErr error
 	for attempt := 0; attempt <= p.cfg.maxRetries; attempt++ {
 		attemptStarted := time.Now()
+		relayStats.touch(requestID)
 		resp, err := p.attempt(r.Context(), r, target, body, requestHadBody)
 		if err != nil {
 			lastErr = err
@@ -356,6 +496,7 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			diagnostics, started, streamErr := p.forwardStream(w, resp, attemptStarted, attempt < p.cfg.maxRetries, p.cfg.bufferUntilSuccess)
 			if streamErr == nil {
 				log.Printf("[response] id=%s method=%s path=%s model=%q status=%d attempts=%d duration=%s first_byte=%s stream=complete committed=%t commit_event=%q bytes=%d events=%d terminal=%q upstream_request_id=%q%s", requestID, r.Method, logPath, requestedModel, resp.StatusCode, attempt+1, time.Since(startedAt).Round(time.Millisecond), diagnostics.firstByte.Round(time.Millisecond), diagnostics.committed, diagnostics.commitEvent, diagnostics.bytes, diagnostics.events, diagnostics.terminal, upstreamID, diagnostics.errorLogFields())
+				relayStats.finish(requestID, resp.StatusCode < 400, diagnostics.terminal == "response.failed" || diagnostics.terminal == "error", attempt > 0)
 				return
 			}
 			lastErr = streamErr
@@ -366,6 +507,10 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 					p.writeUnavailable(w, lastErr)
 				}
 				log.Printf("[response] id=%s method=%s path=%s model=%q status=%d attempts=%d duration=%s stream=incomplete committed=%t commit_event=%q bytes=%d events=%d terminal=%q upstream_request_id=%q transport_error=%q%s", requestID, r.Method, logPath, requestedModel, resp.StatusCode, attempt+1, time.Since(startedAt).Round(time.Millisecond), diagnostics.committed, diagnostics.commitEvent, diagnostics.bytes, diagnostics.events, diagnostics.terminal, upstreamID, safeLogText(streamErr.Error(), 300), diagnostics.errorLogFields())
+				// An incomplete stream whose terminal event was delivered (e.g. the
+				// client hung up right after response.completed) still counts as a
+				// success; only missing/failure terminals count against it.
+				relayStats.finish(requestID, resp.StatusCode < 400, diagnostics.terminal == "response.failed" || diagnostics.terminal == "error", attempt > 0)
 				return
 			}
 			if errors.Is(streamErr, errSSEPreCommitFailure) {
@@ -410,10 +555,12 @@ func (p *proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		log.Printf("[response] id=%s method=%s path=%s model=%q status=%d attempts=%d duration=%s header_time=%s upstream_request_id=%q", requestID, r.Method, logPath, requestedModel, resp.StatusCode, attempt+1, time.Since(startedAt).Round(time.Millisecond), time.Since(attemptStarted).Round(time.Millisecond), upstreamRequestID(resp.Header))
+		relayStats.finish(requestID, resp.StatusCode < 400, false, attempt > 0)
 		return
 	}
 	p.writeUnavailable(w, lastErr)
 	log.Printf("[response] id=%s method=%s path=%s model=%q status=502 attempts=%d duration=%s error=%v", requestID, r.Method, logPath, requestedModel, p.cfg.maxRetries+1, time.Since(startedAt).Round(time.Millisecond), lastErr)
+	relayStats.finish(requestID, false, false, true)
 }
 
 // requestedModelFromBody extracts only the top-level model field for diagnosis;
