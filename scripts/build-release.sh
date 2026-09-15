@@ -50,7 +50,6 @@ build_target() {
   cp "$PROJECT_ROOT/packaging/README.txt" "$package_dir/README.txt"
   cp "$PROJECT_ROOT/README.md" "$package_dir/README.md"
   cp "$PROJECT_ROOT/LICENSE" "$package_dir/LICENSE"
-  cp "$PROJECT_ROOT/packaging/TRUST-GUIDE.zh-CN.txt" "$package_dir/TRUST-GUIDE.zh-CN.txt"
   if [ "$target_os" = windows ]; then
     cp "$PROJECT_ROOT/packaging/start.bat" "$package_dir/start.bat"
   else
