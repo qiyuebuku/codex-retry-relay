@@ -170,6 +170,9 @@ func (s *statsState) report(window time.Duration) {
 }
 
 func statsLoop(interval time.Duration) {
+	// Emit one report immediately so that anyone tail-ing the log sees
+	// output right away instead of waiting a full interval after startup.
+	relayStats.report(interval)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for range ticker.C {
